@@ -196,6 +196,30 @@
                         </div>
 
                         <div class="et-field">
+                            <label class="et-toggle-row" for="et_ctx_group_chat_panel">
+                                <input type="checkbox" id="et_ctx_group_chat_panel" class="checkbox">
+                                <span class="et-label-text"><i class="fa-solid fa-users"></i> Group Chat Context</span>
+                            </label>
+                            <div class="et-hint et-hint-indent">In Tethered mode, inject recent group chat messages into the system prompt so the character is aware of ongoing group conversations during private chats.</div>
+                        </div>
+
+                        <div class="et-field">
+                            <label class="et-text-row" for="et_ctx_group_chat_max_panel">
+                                <span class="et-label-text">Group Chat Max Messages</span>
+                                <input type="number" id="et_ctx_group_chat_max_panel" class="et-text-input" min="1" max="100" style="width:80px;">
+                            </label>
+                            <div class="et-hint et-hint-indent">Maximum number of recent group chat messages to include as context (1-100).</div>
+                        </div>
+
+                        <div class="et-field">
+                            <label class="et-toggle-row" for="et_reverse_injection_panel">
+                                <input type="checkbox" id="et_reverse_injection_panel" class="checkbox">
+                                <span class="et-label-text"><i class="fa-solid fa-arrow-right-arrow-left"></i> Reverse Injection</span>
+                            </label>
+                            <div class="et-hint et-hint-indent">Inject private chat history into group chat generation so the character remembers private conversations when speaking in the group.</div>
+                        </div>
+
+                        <div class="et-field">
                             <label class="et-toggle-row" for="et_ctx_description_panel">
                                 <input type="checkbox" id="et_ctx_description_panel" class="checkbox">
                                 <span class="et-label-text"><i class="fa-solid fa-address-card"></i> Character

@@ -1,12 +1,12 @@
 {
-    "display_name": "EchoText",
+    "display_name": "EchoText (WhisperChat Fork)",
     "loading_order": 1001,
     "requires": [],
     "optional": [],
     "js": "index.js",
     "css": "style.css",
     "author": "mattjaybe",
-    "version": "1.2.6",
-    "homePage": "https://github.com/mattjaybe/SillyTavern-EchoText",
-    "auto_update": true
+    "version": "1.3.0-whisper",
+    "homePage": "https://github.com/h621233/SillyTavern-EchoText",
+    "auto_update": false
 }

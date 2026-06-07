@@ -112,6 +112,7 @@
     // Named event handler references for cleanup
     let _onChatChanged = null;
     let _onGroupUpdated = null;
+    let _onBeforeGroupGenerate = null;
 
     // ============================================================
     // MOBILE / iOS DETECTION & VIEWPORT HELPERS
@@ -475,6 +476,9 @@
         jQuery('#et_ctx_world_info').prop('checked', settings.ctxWorldInfo === true);
         jQuery('#et_ctx_st_messages').prop('checked', settings.ctxSTMessages === true);
         jQuery('#et_ctx_st_context').prop('checked', settings.ctxSTContext === true);
+        jQuery('#et_ctx_group_chat').prop('checked', settings.ctxGroupChat !== false);
+        jQuery('#et_ctx_group_chat_max').val(settings.ctxGroupChatMaxMessages || 20);
+        jQuery('#et_reverse_injection').prop('checked', settings.reverseInjection === true);
         jQuery('#et_proactive_rate_limit').val(settings.proactiveRateLimitMinutes || 180);
         jQuery('#et_proactive_rate_limit_val').text((settings.proactiveRateLimitMinutes || 180) + ' min');
         // Activity mode
@@ -557,6 +561,9 @@
         }
         jQuery('#et_ctx_st_messages_panel').prop('checked', settings.ctxSTMessages === true);
         jQuery('#et_ctx_st_context_panel').prop('checked', settings.ctxSTContext === true);
+        jQuery('#et_ctx_group_chat_panel').prop('checked', settings.ctxGroupChat !== false);
+        jQuery('#et_ctx_group_chat_max_panel').val(settings.ctxGroupChatMaxMessages || 20);
+        jQuery('#et_reverse_injection_panel').prop('checked', settings.reverseInjection === true);
         jQuery('#et_proactive_rate_limit_panel').val(settings.proactiveRateLimitMinutes || 180);
         jQuery('#et_proactive_rate_limit_val_panel').text((settings.proactiveRateLimitMinutes || 180) + ' min');
         // Activity mode
@@ -1043,6 +1050,25 @@
             saveSettings();
             // Sync with modal
             jQuery('#et_ctx_st_context').prop('checked', settings.ctxSTContext);
+        });
+
+        jQuery('#et_ctx_group_chat_panel').off('change.panel').on('change.panel', function () {
+            settings.ctxGroupChat = jQuery(this).is(':checked');
+            saveSettings();
+            jQuery('#et_ctx_group_chat').prop('checked', settings.ctxGroupChat);
+        });
+
+        jQuery('#et_ctx_group_chat_max_panel').off('input.panel change.panel').on('input.panel change.panel', function () {
+            const val = parseInt(jQuery(this).val(), 10);
+            settings.ctxGroupChatMaxMessages = isNaN(val) ? 20 : Math.max(1, Math.min(100, val));
+            saveSettings();
+            jQuery('#et_ctx_group_chat_max').val(settings.ctxGroupChatMaxMessages);
+        });
+
+        jQuery('#et_reverse_injection_panel').off('change.panel').on('change.panel', function () {
+            settings.reverseInjection = jQuery(this).is(':checked');
+            saveSettings();
+            jQuery('#et_reverse_injection').prop('checked', settings.reverseInjection);
         });
 
         // Strip Reasoning Tags toggle
@@ -2201,6 +2227,12 @@
         if (tethered) {
             prompt += buildEmotionContext();
         }
+        if (tethered && settings.ctxGroupChat !== false) {
+            const groupChat = getSTGroupChatContext(settings.ctxGroupChatMaxMessages || 20);
+            if (groupChat) {
+                prompt += '\n\n<group_chat_context>\n以下是你所在的群聊最近的对话（你在私信中也可以感知到这些）：\n' + groupChat + '\n</group_chat_context>';
+            }
+        }
 
         // ── 4. BEHAVIOUR LOCK ────────────────────────────────────────────────────
         // Fiction frame + persona-lock reminder land last so they act as the final
@@ -2353,6 +2385,34 @@
         } catch (e) {
             return null;
         }
+    }
+
+    function getSTGroupChatContext(maxMessages) {
+        try {
+            const context = SillyTavern.getContext();
+            const chat = context.chat;
+            if (!chat || !chat.length) return null;
+            const charName = getCharacterName();
+            const userName = getUserName();
+            const limited = chat.slice(-maxMessages);
+            const lines = limited.map(msg => {
+                const speaker = msg.is_user ? userName : (msg.name || charName);
+                return `${speaker}: ${msg.mes || ''}`;
+            });
+            return lines.join('\n') || null;
+        } catch (e) {
+            return null;
+        }
+    }
+
+    function formatPrivateHistoryForInjection(history) {
+        if (!history || !history.length) return '';
+        const charName = getCharacterName();
+        const userName = getUserName();
+        return history.map(msg => {
+            const speaker = msg.is_user ? userName : (msg.name || charName);
+            return `${speaker}: ${msg.mes || ''}`;
+        }).join('\n');
     }
 
     function getCurrentTimeMacroString() {
@@ -7443,6 +7503,25 @@
             context.eventSource.on(context.event_types.GROUP_UPDATED, _onGroupUpdated);
         }
 
+        // WhisperChat: inject private chat history into group chat generation
+        if (context.event_types.GENERATE_BEFORE_COMBINE_PROMPTS) {
+            _onBeforeGroupGenerate = function(data) {
+                if (!settings.reverseInjection) return;
+                if (!data) return;
+                const charKey = data.draftedCharacter && (data.draftedCharacter.avatar || data.draftedCharacter.name);
+                const groupId = groupManager ? groupManager.getCurrentGroupId() : null;
+                if (!charKey || !groupId) return;
+                const privateHistory = groupManager.getGroupChatHistory(groupId, charKey, false);
+                if (!privateHistory || !privateHistory.length) return;
+                const summary = formatPrivateHistoryForInjection(privateHistory.slice(-10));
+                if (summary) {
+                    data.systemPromptOverride = (data.systemPromptOverride || '') +
+                        '\n\n[你和用户之间有过私下对话：\n' + summary + ']';
+                }
+            };
+            context.eventSource.on(context.event_types.GENERATE_BEFORE_COMBINE_PROMPTS, _onBeforeGroupGenerate);
+        }
+
         log('EchoText initialized successfully');
 
         // ── Live ST theme sync ──────────────────────────────────────────────
@@ -7473,6 +7552,10 @@
             if (_onGroupUpdated && context.event_types.GROUP_UPDATED) {
                 context.eventSource.removeListener(context.event_types.GROUP_UPDATED, _onGroupUpdated);
                 _onGroupUpdated = null;
+            }
+            if (_onBeforeGroupGenerate && context.event_types.GENERATE_BEFORE_COMBINE_PROMPTS) {
+                context.eventSource.removeListener(context.event_types.GENERATE_BEFORE_COMBINE_PROMPTS, _onBeforeGroupGenerate);
+                _onBeforeGroupGenerate = null;
             }
             if (stContextEmotion && typeof stContextEmotion.unbindSTEvents === 'function') {
                 stContextEmotion.unbindSTEvents(context);
