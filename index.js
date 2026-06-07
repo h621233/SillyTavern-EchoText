@@ -112,7 +112,10 @@
     // Named event handler references for cleanup
     let _onChatChanged = null;
     let _onGroupUpdated = null;
-    let _onBeforeGroupGenerate = null;
+    let _onGroupMemberDrafted = null;
+    let _onGroupWrapperFinished = null;
+    // Key for the SillyTavern extension prompt used by WhisperChat reverse injection.
+    const WHISPER_INJECT_KEY = 'echotext_whisper_reverse';
 
     // ============================================================
     // MOBILE / iOS DETECTION & VIEWPORT HELPERS
@@ -2228,7 +2231,7 @@
             prompt += buildEmotionContext();
         }
         if (tethered && settings.ctxGroupChat !== false) {
-            const groupChat = getSTGroupChatContext(settings.ctxGroupChatMaxMessages || 20);
+            const groupChat = await getSTGroupChatContext(settings.ctxGroupChatMaxMessages || 20);
             if (groupChat) {
                 prompt += '\n\n<group_chat_context>\n以下是你所在的群聊最近的对话（你在私信中也可以感知到这些）：\n' + groupChat + '\n</group_chat_context>';
             }
@@ -2387,20 +2390,69 @@
         }
     }
 
-    function getSTGroupChatContext(maxMessages) {
+    // Resolves the group chat messages to inject as private-chat context.
+    //
+    // The original implementation read SillyTavern.getContext().chat directly, but
+    // that only reflects whatever chat is ACTIVE in ST's main window. When the user
+    // browses a group through EchoText's own picker (which sets _overrideGroupId),
+    // the EchoText-selected group can differ from ST's active chat — so context.chat
+    // pointed at the wrong (or empty) conversation and the character "forgot" the
+    // group. We now resolve the EchoText-selected group explicitly: use the live
+    // context.chat when it matches, otherwise fetch that group's active chat file
+    // from the server (POST /api/chats/group/get).
+    async function getSTGroupChatContext(maxMessages) {
         try {
             const context = SillyTavern.getContext();
-            const chat = context.chat;
-            if (!chat || !chat.length) return null;
-            const charName = getCharacterName();
             const userName = getUserName();
+            const charName = getCharacterName();
+
+            const selectedGroupId = (groupManager && groupManager.isGroupSession())
+                ? groupManager.getCurrentGroupId()
+                : null;
+
+            let chat = null;
+
+            if (selectedGroupId) {
+                // Fast path: the EchoText-selected group is ST's active chat.
+                if (String(context.groupId) === String(selectedGroupId)
+                    && Array.isArray(context.chat) && context.chat.length) {
+                    chat = context.chat;
+                } else {
+                    // The selected group is not the active ST chat — fetch its file.
+                    const group = (context.groups || []).find(g => String(g.id) === String(selectedGroupId));
+                    const chatId = group && group.chat_id;
+                    if (chatId) {
+                        const resp = await fetch('/api/chats/group/get', {
+                            method: 'POST',
+                            headers: context.getRequestHeaders(),
+                            body: JSON.stringify({ id: chatId })
+                        });
+                        if (resp.ok) {
+                            const data = await resp.json();
+                            // First element is a header object (chat_metadata); keep only messages.
+                            if (Array.isArray(data)) {
+                                chat = data.filter(m => m && typeof m.mes === 'string');
+                            }
+                        }
+                    }
+                }
+            } else {
+                // Solo session fallback: use the active ST chat as-is.
+                chat = Array.isArray(context.chat) ? context.chat : null;
+            }
+
+            if (!chat || !chat.length) return null;
+
             const limited = chat.slice(-maxMessages);
             const lines = limited.map(msg => {
                 const speaker = msg.is_user ? userName : (msg.name || charName);
                 return `${speaker}: ${msg.mes || ''}`;
             });
-            return lines.join('\n') || null;
+            const result = lines.join('\n') || null;
+            if (result) log(`[WhisperChat] group context injected: ${lines.length} msgs (group ${selectedGroupId || 'solo'})`);
+            return result;
         } catch (e) {
+            error('[WhisperChat] getSTGroupChatContext failed:', e);
             return null;
         }
     }
@@ -7503,23 +7555,55 @@
             context.eventSource.on(context.event_types.GROUP_UPDATED, _onGroupUpdated);
         }
 
-        // WhisperChat: inject private chat history into group chat generation
-        if (context.event_types.GENERATE_BEFORE_COMBINE_PROMPTS) {
-            _onBeforeGroupGenerate = function(data) {
-                if (!settings.reverseInjection) return;
-                if (!data) return;
-                const charKey = data.draftedCharacter && (data.draftedCharacter.avatar || data.draftedCharacter.name);
-                const groupId = groupManager ? groupManager.getCurrentGroupId() : null;
-                if (!charKey || !groupId) return;
-                const privateHistory = groupManager.getGroupChatHistory(groupId, charKey, false);
-                if (!privateHistory || !privateHistory.length) return;
-                const summary = formatPrivateHistoryForInjection(privateHistory.slice(-10));
-                if (summary) {
-                    data.systemPromptOverride = (data.systemPromptOverride || '') +
-                        '\n\n[你和用户之间有过私下对话：\n' + summary + ']';
+        // WhisperChat: inject each member's private chat history into ST group-chat
+        // generation. ST fires GROUP_MEMBER_DRAFTED(chId) right before Generate()
+        // builds that member's prompt, so we register a SillyTavern extension prompt
+        // (setExtensionPrompt) scoped to the character about to speak. This is the
+        // standard, API-agnostic injection mechanism — the previously-attempted
+        // data.systemPromptOverride field does not exist in ST and was silently
+        // ignored. The prompt is cleared when the group turn finishes so it never
+        // leaks into solo chats or other characters.
+        if (context.event_types.GROUP_MEMBER_DRAFTED) {
+            _onGroupMemberDrafted = function(chId) {
+                try {
+                    const ctx = SillyTavern.getContext();
+                    const clear = () => ctx.setExtensionPrompt(WHISPER_INJECT_KEY, '');
+                    if (!settings.reverseInjection) return clear();
+
+                    const character = ctx.characters && ctx.characters[chId];
+                    const charKey = character && (character.avatar || character.name);
+                    // Use the group actually being generated in ST's main window.
+                    const groupId = ctx.groupId != null ? String(ctx.groupId)
+                        : (groupManager ? groupManager.getCurrentGroupId() : null);
+                    if (!charKey || !groupId) return clear();
+
+                    const privateHistory = groupManager
+                        ? groupManager.getGroupChatHistory(groupId, charKey, false)
+                        : null;
+                    if (!privateHistory || !privateHistory.length) return clear();
+
+                    const summary = formatPrivateHistoryForInjection(privateHistory.slice(-10));
+                    if (!summary) return clear();
+
+                    const charName = (character && character.name) || 'You';
+                    const text = `[你（${charName}）和用户之间有过私下对话，你记得这些内容（其他人不知道）：\n${summary}]`;
+                    // position 0 = IN_PROMPT (story/system region), depth 0, role defaults to SYSTEM.
+                    ctx.setExtensionPrompt(WHISPER_INJECT_KEY, text, 0, 0);
+                    log(`[WhisperChat] reverse-inject for ${charName}: ${privateHistory.slice(-10).length} private msgs`);
+                } catch (e) {
+                    error('[WhisperChat] reverse injection failed:', e);
                 }
             };
-            context.eventSource.on(context.event_types.GENERATE_BEFORE_COMBINE_PROMPTS, _onBeforeGroupGenerate);
+            context.eventSource.on(context.event_types.GROUP_MEMBER_DRAFTED, _onGroupMemberDrafted);
+        }
+
+        // Clear the reverse-injection extension prompt once the group turn ends so it
+        // does not leak into subsequent solo or non-group generations.
+        if (context.event_types.GROUP_WRAPPER_FINISHED) {
+            _onGroupWrapperFinished = function() {
+                try { SillyTavern.getContext().setExtensionPrompt(WHISPER_INJECT_KEY, ''); } catch (e) { /* ignore */ }
+            };
+            context.eventSource.on(context.event_types.GROUP_WRAPPER_FINISHED, _onGroupWrapperFinished);
         }
 
         log('EchoText initialized successfully');
@@ -7553,10 +7637,15 @@
                 context.eventSource.removeListener(context.event_types.GROUP_UPDATED, _onGroupUpdated);
                 _onGroupUpdated = null;
             }
-            if (_onBeforeGroupGenerate && context.event_types.GENERATE_BEFORE_COMBINE_PROMPTS) {
-                context.eventSource.removeListener(context.event_types.GENERATE_BEFORE_COMBINE_PROMPTS, _onBeforeGroupGenerate);
-                _onBeforeGroupGenerate = null;
+            if (_onGroupMemberDrafted && context.event_types.GROUP_MEMBER_DRAFTED) {
+                context.eventSource.removeListener(context.event_types.GROUP_MEMBER_DRAFTED, _onGroupMemberDrafted);
+                _onGroupMemberDrafted = null;
             }
+            if (_onGroupWrapperFinished && context.event_types.GROUP_WRAPPER_FINISHED) {
+                context.eventSource.removeListener(context.event_types.GROUP_WRAPPER_FINISHED, _onGroupWrapperFinished);
+                _onGroupWrapperFinished = null;
+            }
+            try { context.setExtensionPrompt(WHISPER_INJECT_KEY, ''); } catch (e) { /* ignore */ }
             if (stContextEmotion && typeof stContextEmotion.unbindSTEvents === 'function') {
                 stContextEmotion.unbindSTEvents(context);
             }
