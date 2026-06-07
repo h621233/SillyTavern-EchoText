@@ -1,6 +1,7 @@
 <div align="center">
 
 # FORK OF ECHOTEXT! WORKING ON DESC....
+# ORIGINAL PLUGIN https://github.com/mattjaybe/SillyTavern-EchoText
 # 💬 EchoText
 
 ### Text your characters. Like, actually text them.
